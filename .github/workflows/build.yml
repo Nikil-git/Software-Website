@@ -26,13 +26,21 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install PyQt6 numpy opencv-python sounddevice imageio-ffmpeg pyinstaller
+
+      - name: Verify source
+        run: |
+          if (!(Test-Path "Software.py")) {
+            Write-Error "Software.py was not found in the repository root."
+            exit 1
+          }
+          python -m py_compile Software.py
 
       - name: Build executable
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed --name PhysicsSoftware --collect-all PyQt6 --collect-all cv2 --collect-all sounddevice --collect-all imageio_ffmpeg Software.py
 
-      - name: Upload Windows executable
+      - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
           name: PhysicsSoftware-Windows
