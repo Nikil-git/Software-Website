@@ -6,7 +6,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="theme-color" content="#080b12">
     <title>Physics Software | Download</title>
-    <meta name="description" content="Download Physics Software for Windows — an interactive physics whiteboard application built by Nikil Pranav.">
 
     <style>
         * {
@@ -30,30 +29,6 @@
             width: 100%;
             max-width: 680px;
             text-align: center;
-        }
-
-        h1 {
-            font-size: clamp(38px, 7vw, 64px);
-            line-height: 1.08;
-            letter-spacing: -2px;
-            color: #f8fafc;
-            margin-bottom: 20px;
-        }
-
-        h1 span {
-            color: #38bdf8;
-        }
-
-        .description {
-            max-width: 520px;
-            margin: 0 auto;
-            color: #94a3b8;
-            font-size: 17px;
-            line-height: 1.7;
-        }
-
-        .download-section {
-            margin-top: 38px;
         }
 
         .download-button {
@@ -80,64 +55,24 @@
             width: 20px;
             height: 20px;
         }
-
-        .details {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 14px;
-            margin-top: 55px;
-            text-align: left;
-        }
-
-        .detail-card {
-            padding: 18px;
-            border: 1px solid #1e293b;
-            border-radius: 10px;
-            background: #0d1420;
-        }
-
-        .detail-label {
-            display: block;
-            margin-bottom: 8px;
-            color: #64748b;
-            font-size: 11px;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-        }
-
-        .detail-value {
-            color: #e2e8f0;
-            font-size: 14px;
-            font-weight: 600;
-        }
-
-        @media (max-width: 480px) {
-            .details {
-                grid-template-columns: 1fr;
-            }
-
-            .description {
-                font-size: 15px;
-            }
-        }
     </style>
 </head>
+
 <body>
-        <section class="download-section">
-            <a
-                class="download-button"
-                href="https://github.com/Nikil-git/Software-Website/releases/download/tag/PhysicsSoftware.exe"
-                download
-            >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                    <path d="m7 10 5 5 5-5"/>
-                    <path d="M12 15V3"/>
-                </svg>
-                Download for Windows
-            </a>
-        </section>
+    <main class="container">
+        <a
+            class="download-button"
+            href="https://github.com/Nikil-git/Software-Website/releases/download/tag/PhysicsSoftware.exe"
+            download
+        >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <path d="m7 10 5 5 5-5"/>
+                <path d="M12 15V3"/>
+            </svg>
+            Download for Windows
+        </a>
     </main>
 </body>
 </html>
