@@ -8,7 +8,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -31,7 +31,7 @@ jobs:
       - name: Verify source
         run: |
           if (!(Test-Path "Software.py")) {
-            Write-Error "Software.py was not found in the repository root."
+            Write-Error "Software.py was not found."
             exit 1
           }
           python -m py_compile Software.py
@@ -40,9 +40,12 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed --name PhysicsSoftware --collect-all PyQt6 --collect-all cv2 --collect-all sounddevice --collect-all imageio_ffmpeg Software.py
 
-      - name: Upload executable
-        uses: actions/upload-artifact@v4
+      - name: Publish direct EXE download
+        uses: softprops/action-gh-release@v2
         with:
-          name: PhysicsSoftware-Windows
-          path: dist/PhysicsSoftware.exe
-          if-no-files-found: error
+          tag_name: latest
+          name: Latest Physics Software
+          body: Latest Windows build of Physics Software.
+          target_commitish: main
+          files: dist/PhysicsSoftware.exe
+          overwrite_files: true
