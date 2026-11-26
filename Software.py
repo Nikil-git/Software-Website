@@ -1,7 +1,26 @@
+"""
+Physics Software - whiteboard + lecture recorder (Python 3, PyQt6)
+
+Tuned for a low-power laptop (Dell Vostro 15-3568, Core i3-6006U, HD 520,
+4-8 GB RAM, HDD):
+  * 1280x720 @ 24 fps (a whiteboard does not need more, and it is 2.25x
+    cheaper than 1080p)
+  * frames are streamed straight into ffmpeg (no huge raw file, no second
+    encode pass); audio is streamed to disk in chunks (no growing RAM list)
+  * only 3 worker threads (webcam, video writer, audio writer); ffmpeg is
+    limited to 2 threads and runs at below-normal priority
+  * Intel Quick Sync (h264_qsv) is used automatically if your ffmpeg has it
+  * unchanged frames are not re-rendered; the screen repaints only the
+    small area that changed
+
+pip install PyQt6 opencv-python numpy sounddevice imageio-ffmpeg
+(For Quick Sync, put a full ffmpeg build on PATH, e.g. from gyan.dev.)
+"""
 import os
 import sys
 import time
 import wave
+import queue
 import shutil
 import threading
 import subprocess
@@ -11,7 +30,8 @@ import numpy as np
 import cv2
 from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QEvent, pyqtSignal, QSettings
 from PyQt6.QtGui import (QImage, QPainter, QPen, QColor, QAction, QKeySequence,
-                         QPointingDevice, QPainterPath, QRadialGradient, QBrush)
+                         QPointingDevice, QPainterPath, QRadialGradient, QBrush,
+                         QFont, QFontMetrics)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QToolBar,
                              QPushButton, QLabel, QSlider, QFileDialog,
                              QDialog, QFormLayout, QComboBox, QCheckBox,
@@ -23,13 +43,18 @@ except Exception:
     sd = None
 
 # ----------------------------------------------------------------- settings
-CANVAS_W, CANVAS_H = 1920, 1080
-FPS = 30
+CANVAS_W, CANVAS_H = 1280, 720        # video size (set 1920, 1080 only on a faster PC)
+S = CANVAS_H / 1080.0                 # scale factor for sizes designed at 1080p
+FPS = 24
 AUDIO_RATE = 44100
 OUT_DIR = os.path.join(os.path.expanduser("~"), "Videos", "PhysicsBoard")
-MAX_UNDO = 15
-CAM_RES = 360
-CAM_SIZES = [200, 280, 380]
+MAX_UNDO = 10                         # each snapshot is ~3.5 MB at 720p
+VIDEO_QUEUE = 6                       # frames waiting for the encoder (~21 MB max)
+IO_BUFFER = 1 << 20                   # 1 MB sequential disk writes
+CAM_RES = 240                         # internal webcam square size
+CAM_FPS = 20                          # webcam processing rate (saves CPU)
+CAM_RETRY_S = 2.0
+CAM_SIZES = [int(200 * S), int(280 * S), int(380 * S)]
 CAM_CORNERS = ["bottom-right", "bottom-left", "top-right", "top-left"]
 COLORS = {
     "White": "#ffffff", "Yellow": "#ffe14d", "Cyan": "#4dd9ff",
@@ -41,17 +66,15 @@ WATERMARK = "Made by NikilPranav"
 
 REC_STYLE = "background:#d32f2f;color:white;font-weight:bold;padding:8px 16px;"
 STOP_STYLE = "background:#333;color:white;font-weight:bold;padding:8px 16px;"
-CAM_RETRY_MS = 2000
-CAM_MAX_RETRIES = 60
 
 DEFAULTS = {
-    "bg": "#101418",
-    "pen": "#ffffff",
-    "corner": CAM_CORNERS[0],
-    "size": CAM_SIZES[1],
-    "width": 4.0,
-    "startup": True,
+    "bg": "#101418", "pen": "#ffffff", "corner": CAM_CORNERS[0],
+    "size": CAM_SIZES[1], "width": 4.0, "startup": True,
 }
+
+WIN = sys.platform == "win32"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if WIN else 0
+BELOW_NORMAL = 0x00004000 if WIN else 0
 
 
 def find_ffmpeg():
@@ -65,41 +88,319 @@ def find_ffmpeg():
         return None
 
 
+def probe_encoder(ffmpeg):
+    """Returns 'h264_qsv' (Intel Quick Sync) if it really works, else 'libx264'."""
+    if not ffmpeg:
+        return "libx264"
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+             "testsrc=size=640x360:rate=10:duration=0.5", "-c:v", "h264_qsv",
+             "-f", "null", "-"],
+            capture_output=True, timeout=20, creationflags=NO_WINDOW)
+        return "h264_qsv" if r.returncode == 0 else "libx264"
+    except Exception:
+        return "libx264"
+
+
 # ------------------------------------------------------------------- webcam
 class Webcam:
-    """Grabs webcam frames in a background thread (centre-cropped square, RGB)."""
+    """Background thread: opens the webcam, keeps the latest square RGB frame,
+    reconnects by itself if the camera is missing or unplugged.
+    state: "off" | "waiting" | "on".  seq increases whenever frame changes."""
 
     def __init__(self):
         self.frame = None
+        self.seq = 0
         self.running = False
+        self.state = "off"
+        self._gen = 0
 
     def start(self):
-        api = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-        cap = cv2.VideoCapture(0, api)
-        if not cap.isOpened():
-            cap.release()
-            return False
+        if self.running:
+            return
         self.running = True
-        threading.Thread(target=self._loop, args=(cap,), daemon=True).start()
-        return True
-
-    def _loop(self, cap):
-        while self.running:
-            ok, img = cap.read()
-            if not ok:
-                time.sleep(0.05)
-                continue
-            h, w = img.shape[:2]
-            m = min(h, w)
-            y0, x0 = (h - m) // 2, (w - m) // 2
-            sq = cv2.resize(img[y0:y0 + m, x0:x0 + m], (CAM_RES, CAM_RES),
-                            interpolation=cv2.INTER_AREA)
-            self.frame = np.ascontiguousarray(cv2.cvtColor(sq, cv2.COLOR_BGR2RGB))
-        cap.release()
+        self._gen += 1
+        self.state = "waiting"
+        threading.Thread(target=self._run, args=(self._gen,), daemon=True).start()
 
     def stop(self):
         self.running = False
         self.frame = None
+        self.seq += 1
+        self.state = "off"
+
+    def _alive(self, gen):
+        return self.running and gen == self._gen
+
+    def _wait(self, gen, seconds):
+        end = time.time() + seconds
+        while self._alive(gen) and time.time() < end:
+            time.sleep(0.1)
+
+    def _open(self):
+        api = cv2.CAP_DSHOW if WIN else cv2.CAP_ANY
+        cap = cv2.VideoCapture(0, api)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)     # small capture = less USB/CPU work
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    def _run(self, gen):
+        interval = 1.0 / CAM_FPS
+        while self._alive(gen):
+            cap = self._open()                      # opened here, so the UI never freezes
+            if cap is None:
+                if gen == self._gen:
+                    self.state = "waiting"
+                self._wait(gen, CAM_RETRY_S)
+                continue
+            self.state = "on"
+            fails, last = 0, 0.0
+            while self._alive(gen):
+                if not cap.grab():                  # cheap: no decoding yet
+                    fails += 1
+                    if fails >= 40:                 # camera lost
+                        break
+                    time.sleep(0.05)
+                    continue
+                fails = 0
+                now = time.time()
+                if now - last < interval:           # skip frames we don't need
+                    continue
+                ok, img = cap.retrieve()
+                if not ok or img is None:
+                    continue
+                last = now
+                h, w = img.shape[:2]
+                m = min(h, w)
+                y0, x0 = (h - m) // 2, (w - m) // 2
+                sq = cv2.resize(img[y0:y0 + m, x0:x0 + m], (CAM_RES, CAM_RES),
+                                interpolation=cv2.INTER_AREA)
+                self.frame = np.ascontiguousarray(cv2.cvtColor(sq, cv2.COLOR_BGR2RGB))
+                self.seq += 1
+            cap.release()
+            if gen == self._gen:
+                self.frame = None
+                self.seq += 1
+                self.state = "waiting" if self.running else "off"
+
+
+# ----------------------------------------------------------------- recorder
+class Recorder:
+    """Streams frames to ffmpeg and microphone audio to a wav file while
+    recording, then muxes (no re-encoding) when stopped."""
+
+    def __init__(self, base, ffmpeg, encoder, on_done):
+        self.base = base
+        self.ffmpeg = ffmpeg
+        self.encoder = encoder
+        self.on_done = on_done                       # on_done(message, hw_failed)
+        self.video_tmp = base + "_video.mp4"
+        self.wav = base + ".wav"
+        self.final = base + ".mp4"
+        self.log_path = base + "_ffmpeg.log"
+        self.vq = queue.Queue(maxsize=VIDEO_QUEUE)
+        self.aq = None
+        self.proc = None
+        self.cvw = None
+        self.log = None
+        self.stream = None
+        self.wf = None
+        self.wfile = None
+        self.athread = None
+        self.vthread = None
+        self.rate = AUDIO_RATE
+        self.paused = False
+        self.frames = 0
+        self.error = ""
+        self.audio_error = ""
+
+    # ---- start
+    def start(self, use_mic=True):
+        os.makedirs(OUT_DIR, exist_ok=True)
+        if self.ffmpeg:
+            cmd = [self.ffmpeg, "-y", "-f", "rawvideo", "-pix_fmt", "bgra",
+                   "-s", f"{CANVAS_W}x{CANVAS_H}", "-r", str(FPS), "-i", "-", "-an"]
+            if self.encoder == "h264_qsv":
+                cmd += ["-c:v", "h264_qsv", "-preset", "veryfast",
+                        "-global_quality", "27", "-look_ahead", "0", "-pix_fmt", "nv12"]
+            else:
+                cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+                        "-threads", "2", "-pix_fmt", "yuv420p"]
+            cmd += ["-g", str(FPS * 2), self.video_tmp]
+            self.log = open(self.log_path, "wb")
+            self.proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.log,
+                creationflags=NO_WINDOW | BELOW_NORMAL)
+        else:
+            self.cvw = cv2.VideoWriter(self.video_tmp, cv2.VideoWriter_fourcc(*"mp4v"),
+                                       FPS, (CANVAS_W, CANVAS_H))
+            if not self.cvw.isOpened():
+                raise RuntimeError("Could not start the video writer.")
+        if use_mic:
+            self._open_mic()
+        self.vthread = threading.Thread(target=self._video_loop, daemon=True)
+        self.vthread.start()
+
+    def _open_mic(self):
+        if sd is None:
+            self.audio_error = "sounddevice is not installed."
+            return
+        try:
+            dev = sd.query_devices(kind="input")
+            dev_id = sd.default.device[0]
+            if dev_id is None or dev_id < 0:
+                dev_id = None                         # None = system default input
+            if int(dev.get("max_input_channels", 0)) < 1:
+                raise RuntimeError("No microphone input device is available.")
+            rates = []
+            for r in (int(dev.get("default_samplerate") or AUDIO_RATE),
+                      AUDIO_RATE, 48000, 44100, 32000, 22050):
+                if r not in rates:
+                    rates.append(r)
+            last = None
+            for r in rates:
+                try:
+                    sd.check_input_settings(device=dev_id, channels=1,
+                                            dtype="int16", samplerate=r)
+                    self._begin_audio(r)
+                    self.stream = sd.InputStream(device=dev_id, samplerate=r, channels=1,
+                                                 dtype="int16", latency="high",
+                                                 callback=self._audio_cb)
+                    self.stream.start()
+                    return
+                except Exception as ex:
+                    last = ex
+                    self._abort_audio()
+            raise RuntimeError(str(last or "Could not open the microphone."))
+        except Exception as ex:
+            self.audio_error = str(ex)
+
+    def _begin_audio(self, rate):
+        self.rate = rate
+        self.aq = queue.Queue()
+        self.wfile = open(self.wav, "wb", buffering=IO_BUFFER)
+        self.wf = wave.open(self.wfile, "wb")
+        self.wf.setnchannels(1)
+        self.wf.setsampwidth(2)
+        self.wf.setframerate(rate)
+        self.athread = threading.Thread(target=self._audio_loop, daemon=True)
+        self.athread.start()
+
+    def _abort_audio(self):
+        if self.aq is not None:
+            self.aq.put(None)
+            self.athread.join()
+            self.aq = None
+            try:
+                os.remove(self.wav)
+            except OSError:
+                pass
+
+    def _audio_cb(self, indata, frames, time_info, status):
+        if not self.paused:
+            self.aq.put_nowait(indata.copy())          # tiny; the writer thread drains it
+
+    def _audio_loop(self):
+        try:
+            while True:
+                chunk = self.aq.get()
+                if chunk is None:
+                    break
+                self.wf.writeframes(chunk.tobytes())
+        finally:
+            self.wf.close()
+            self.wfile.close()
+
+    # ---- video
+    def push(self, data, count):
+        """Queue `count` copies of the same frame (same bytes object, no extra RAM).
+        If the encoder is behind, stop; the caller catches up on the next tick."""
+        for _ in range(count):
+            try:
+                self.vq.put_nowait(data)
+            except queue.Full:
+                break
+            self.frames += 1
+
+    def _write(self, data):
+        if self.proc is not None:
+            self.proc.stdin.write(data)
+        else:
+            arr = np.frombuffer(data, np.uint8).reshape(CANVAS_H, CANVAS_W, 4)
+            self.cvw.write(np.ascontiguousarray(arr[:, :, :3]))   # bgra -> bgr
+
+    def _video_loop(self):
+        ok = True
+        while True:
+            data = self.vq.get()
+            if data is None:
+                break
+            if ok:
+                try:
+                    self._write(data)
+                except Exception as ex:                # e.g. ffmpeg died: keep draining
+                    ok = False
+                    self.error = str(ex)
+        self._finish(ok)
+
+    def stop(self):
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+        self.vq.put(None)
+
+    def _finish(self, ok):
+        hw_failed = False
+        try:
+            rc = 0
+            if self.proc is not None:
+                try:
+                    self.proc.stdin.close()
+                except Exception:
+                    pass
+                rc = self.proc.wait()
+                self.log.close()
+            elif self.cvw is not None:
+                self.cvw.release()
+            if self.aq is not None:
+                self.aq.put(None)
+                self.athread.join()
+            if rc != 0 or not ok:
+                hw_failed = self.encoder != "libx264"
+                extra = " Quick Sync failed - the software encoder will be used next time." \
+                    if hw_failed else ""
+                self.on_done(f"Encoding failed (see {self.log_path}).{extra}", hw_failed)
+                return
+            has_audio = (self.aq is not None and os.path.exists(self.wav)
+                         and os.path.getsize(self.wav) > 44)
+            note = ""
+            if has_audio and self.ffmpeg:
+                subprocess.run(
+                    [self.ffmpeg, "-y", "-i", self.video_tmp, "-i", self.wav,
+                     "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", self.final],
+                    check=True, capture_output=True, creationflags=NO_WINDOW)
+                os.remove(self.video_tmp)
+                os.remove(self.wav)
+            else:
+                os.replace(self.video_tmp, self.final)
+                if has_audio:
+                    note = " (ffmpeg not found: audio kept as a separate .wav file)"
+            for p in (self.log_path,):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            self.on_done(f"Saved: {self.final}{note}", False)
+        except Exception as ex:
+            self.on_done(f"Saved raw files in {OUT_DIR} (finishing failed: {ex})", False)
 
 
 # -------------------------------------------------------------------- board
@@ -112,66 +413,73 @@ class Board(QWidget):
         self.pen_color = QColor("#ffffff")
         self.base_width = 4.0
         self.eraser_on = False
-        self.undo_stack = []
+        self.undo_stack = []            # list of (image, background colour)
         self.drawing = False
         self.last = None
         self.laser_on = False
         self.laser_pos = None
+        self.laser_r = int(34 * S)
         self.cam = Webcam()
         self.cam_on = False
         self.cam_diam = CAM_SIZES[1]
         self.cam_corner = CAM_CORNERS[0]
+        self.version = 0                # bumps on every visible change (recorder uses it)
+
+        # watermark geometry computed once
+        self._wm_font = QFont()
+        self._wm_font.setPixelSize(int(26 * S))
+        self._wm_font.setBold(True)
+        fm = QFontMetrics(self._wm_font)
+        bw = fm.horizontalAdvance(WATERMARK) + int(36 * S)
+        bh = fm.height() + int(10 * S)
+        self._wm_rect = QRectF((CANVAS_W - bw) / 2, CANVAS_H - bh - int(22 * S), bw, bh)
+
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setMouseTracking(True)
         self.setMinimumSize(640, 360)
 
+    # ---- geometry helpers
     def _view(self):
         s = min(self.width() / CANVAS_W, self.height() / CANVAS_H)
-        w, h = CANVAS_W * s, CANVAS_H * s
-        return s, (self.width() - w) / 2, (self.height() - h) / 2
+        return s, (self.width() - CANVAS_W * s) / 2, (self.height() - CANVAS_H * s) / 2
 
     def _to_canvas(self, p):
         s, x0, y0 = self._view()
         return QPointF((p.x() - x0) / s, (p.y() - y0) / s)
 
-    def _draw_watermark(self, p):
-        """Permanent badge at the bottom-centre. Visible on screen and in video."""
-        font = p.font()
-        font.setPointSize(20)
-        font.setBold(True)
-        p.setFont(font)
-        fm = p.fontMetrics()
-        tw = fm.horizontalAdvance(WATERMARK)
-        th = fm.height()
-        pad_x, pad_y = 18, 10
-        box_w = tw + pad_x * 2
-        box_h = th + pad_y
-        x = (CANVAS_W - box_w) / 2
-        y = CANVAS_H - box_h - 22
-        rect = QRectF(x, y, box_w, box_h)
+    def _to_widget_rect(self, r):
+        s, x0, y0 = self._view()
+        return QRectF(x0 + r.x() * s, y0 + r.y() * s,
+                      r.width() * s, r.height() * s).toAlignedRect().adjusted(-2, -2, 2, 2)
 
-        if self.bg.lightness() < 128:
-            fill = QColor(0, 0, 0, 120)
-            fg = QColor(255, 255, 255, 210)
-        else:
-            fill = QColor(255, 255, 255, 210)
-            fg = QColor(0, 0, 0, 190)
+    def _cam_rect(self):
+        d, m = self.cam_diam, int(30 * S)
+        x = m if "left" in self.cam_corner else CANVAS_W - d - m
+        y = m if "top" in self.cam_corner else CANVAS_H - d - m
+        return QRectF(x, y, d, d)
 
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(fill)
-        p.drawRoundedRect(rect, 14, 14)
-        p.setPen(fg)
-        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, WATERMARK)
-        p.setBrush(Qt.BrushStyle.NoBrush)
+    def _laser_rect(self, pt):
+        if pt is None:
+            return None
+        r = self.laser_r + 3
+        return QRectF(pt.x() - r, pt.y() - r, 2 * r, 2 * r)
 
+    def touch(self, *rects):
+        """Mark the picture as changed and repaint only the affected area."""
+        self.version += 1
+        if not rects:
+            self.update()
+            return
+        for r in rects:
+            if r is not None:
+                self.update(self._to_widget_rect(r))
+
+    # ---- painting
     def _draw_overlays(self, p):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         frame = self.cam.frame if self.cam_on else None
         if frame is not None:
-            d, m = self.cam_diam, 30
-            x = m if "left" in self.cam_corner else CANVAS_W - d - m
-            y = m if "top" in self.cam_corner else CANVAS_H - d - m
-            rect = QRectF(x, y, d, d)
+            rect = self._cam_rect()
             qimg = QImage(frame.data, frame.shape[1], frame.shape[0],
                           frame.strides[0], QImage.Format.Format_RGB888)
             path = QPainterPath()
@@ -180,81 +488,112 @@ class Board(QWidget):
             p.setClipPath(path)
             p.drawImage(rect, qimg)
             p.restore()
-            p.setPen(QPen(QColor("white"), 5))
+            p.setPen(QPen(QColor("white"), 4))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(rect)
         if self.laser_pos is not None:
-            c = self.laser_pos
-            g = QRadialGradient(c, 34)
+            c, r = self.laser_pos, self.laser_r
+            g = QRadialGradient(c, r)
             g.setColorAt(0.0, QColor(255, 60, 60, 255))
             g.setColorAt(0.3, QColor(255, 30, 30, 220))
             g.setColorAt(1.0, QColor(255, 0, 0, 0))
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(g))
-            p.drawEllipse(c, 34, 34)
+            p.drawEllipse(c, r, r)
             p.setBrush(QColor(255, 255, 255))
-            p.drawEllipse(c, 4, 4)
-        self._draw_watermark(p)
+            p.drawEllipse(c, 3, 3)
+        # watermark
+        if self.bg.lightness() < 128:
+            fill, fg = QColor(0, 0, 0, 120), QColor(255, 255, 255, 210)
+        else:
+            fill, fg = QColor(255, 255, 255, 210), QColor(0, 0, 0, 190)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fill)
+        p.drawRoundedRect(self._wm_rect, 12, 12)
+        p.setFont(self._wm_font)
+        p.setPen(fg)
+        p.drawText(self._wm_rect, Qt.AlignmentFlag.AlignCenter, WATERMARK)
 
     def render_frame(self):
+        """Board + overlays as one image (this is what gets recorded)."""
         img = self.image.copy()
         p = QPainter(img)
         self._draw_overlays(p)
         p.end()
         return img
 
-    def paintEvent(self, _):
+    def paintEvent(self, ev):
         s, x0, y0 = self._view()
-        p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#222"))
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p = QPainter(self)                      # Qt already clips this to the dirty area
+        p.fillRect(ev.rect(), QColor("#222"))
+        if abs(s - 1.0) > 0.01:
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.translate(x0, y0)
         p.scale(s, s)
         p.drawImage(0, 0, self.image)
         self._draw_overlays(p)
 
+    # ---- undo keeps the board colour together with the picture
     def push_undo(self):
-        self.undo_stack.append(self.image.copy())
+        self.undo_stack.append((self.image.copy(), QColor(self.bg)))
         if len(self.undo_stack) > MAX_UNDO:
             self.undo_stack.pop(0)
 
     def undo(self):
         if self.undo_stack:
-            self.image = self.undo_stack.pop()
-            self.update()
+            self.image, self.bg = self.undo_stack.pop()
+            self.touch()
 
     def clear(self):
         self.push_undo()
         self.image.fill(self.bg)
-        self.update()
+        self.touch()
 
-    def set_background(self, color, clear=True):
+    def set_background(self, color, undoable=True):
+        """Changing board colour wipes the board (old ink would be unreadable)."""
+        if undoable:
+            self.push_undo()
         self.bg = QColor(color)
-        if clear:
-            self.clear()
-        else:
-            self.update()
+        self.image.fill(self.bg)
+        self.touch()
+
+    def set_cam(self, corner=None, diam=None):
+        old = self._cam_rect()
+        if corner:
+            self.cam_corner = corner
+        if diam:
+            self.cam_diam = diam
+        self.touch(old, self._cam_rect())
 
     def set_laser(self, on):
+        old = self.laser_pos
         self.laser_on = on
         self.laser_pos = None
         self.drawing = False
-        self.update()
+        self.touch(self._laser_rect(old))
 
+    def _move_laser(self, pt):
+        old = self.laser_pos
+        self.laser_pos = pt
+        self.touch(self._laser_rect(old), self._laser_rect(pt))
+
+    # ---- drawing
     def _segment(self, p0, p1, pressure, erase):
         painter = QPainter(self.image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if erase:
-            pen = QPen(self.bg, 45)
+            w = 45 * S
+            pen = QPen(self.bg, w)
         else:
-            width = self.base_width * (0.25 + 1.25 * max(0.0, min(1.0, pressure)))
-            pen = QPen(self.pen_color, width)
+            w = self.base_width * (0.25 + 1.25 * max(0.0, min(1.0, pressure)))
+            pen = QPen(self.pen_color, w)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
         painter.drawLine(p0, p1)
         painter.end()
-        self.update()
+        m = w + 4
+        self.touch(QRectF(p0, p1).normalized().adjusted(-m, -m, m, m))
 
     def _press(self, pos, pressure, erase):
         self.push_undo()
@@ -275,13 +614,11 @@ class Board(QWidget):
     def tabletEvent(self, e):
         t = e.type()
         if t == QEvent.Type.TabletLeaveProximity:
-            self.laser_pos = None
-            self.update()
+            self._move_laser(None)
             e.accept()
             return
         if self.laser_on:
-            self.laser_pos = self._to_canvas(e.position())
-            self.update()
+            self._move_laser(self._to_canvas(e.position()))
             e.accept()
             return
         erase = (self.eraser_on or
@@ -296,15 +633,13 @@ class Board(QWidget):
 
     def mousePressEvent(self, e):
         if self.laser_on:
-            self.laser_pos = self._to_canvas(e.position())
-            self.update()
+            self._move_laser(self._to_canvas(e.position()))
         elif e.button() == Qt.MouseButton.LeftButton:
             self._press(e.position(), 0.6, self.eraser_on)
 
     def mouseMoveEvent(self, e):
         if self.laser_on:
-            self.laser_pos = self._to_canvas(e.position())
-            self.update()
+            self._move_laser(self._to_canvas(e.position()))
         else:
             self._move(e.position(), 0.6, self.eraser_on)
 
@@ -313,8 +648,7 @@ class Board(QWidget):
 
     def leaveEvent(self, e):
         if self.laser_pos is not None:
-            self.laser_pos = None
-            self.update()
+            self._move_laser(None)
 
 
 # ----------------------------------------------------------- settings dialog
@@ -355,8 +689,7 @@ class SettingsDialog(QDialog):
         form.addRow("Webcam position:", self.corner_combo)
 
         self.size_combo = QComboBox()
-        for label, val in (("Small", CAM_SIZES[0]), ("Medium", CAM_SIZES[1]),
-                           ("Large", CAM_SIZES[2])):
+        for label, val in zip(("Small", "Medium", "Large"), CAM_SIZES):
             self.size_combo.addItem(label, val)
         idx = self.size_combo.findData(cfg["size"])
         self.size_combo.setCurrentIndex(idx if idx >= 0 else 1)
@@ -367,8 +700,6 @@ class SettingsDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save |
                                    QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Save")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancel")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
@@ -379,8 +710,7 @@ class SettingsDialog(QDialog):
 
     def _bg_changed(self):
         dark = QColor(self.bg_combo.currentData()).lightness() < 128
-        want = "#ffffff" if dark else "#000000"
-        idx = self.pen_combo.findData(want)
+        idx = self.pen_combo.findData("#ffffff" if dark else "#000000")
         if idx >= 0:
             self.pen_combo.setCurrentIndex(idx)
 
@@ -397,7 +727,8 @@ class SettingsDialog(QDialog):
 
 # --------------------------------------------------------------- main window
 class MainWindow(QMainWindow):
-    finished = pyqtSignal(str)
+    finished = pyqtSignal(str, bool)
+    encoder_probed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -409,36 +740,45 @@ class MainWindow(QMainWindow):
         self.store = QSettings("PhysicsSoftware", "PhysicsBoard")
         self.cfg = self._load_settings()
 
-        self.recording = False
+        self.rec = None
         self.paused = False
         self.paused_total = 0.0
         self.pause_started = 0.0
-        self.writer = None
         self.t0 = 0.0
-        self.frames_written = 0
-        self.raw_video = ""
-        self.base = ""
-        self.audio_chunks = []
-        self.stream = None
-        self.audio_rate = AUDIO_RATE
-        self.audio_error = ""
+        self.workers = []
+        self._frame_sig = None
+        self._frame_bytes = None
+        self._seen_cam_seq = -1
+
         self.rec_timer = QTimer(self)
         self.rec_timer.timeout.connect(self._grab_frame)
         self.clock = QTimer(self)
         self.clock.timeout.connect(self._tick_label)
-        self.ui_timer = QTimer(self)
-        self.ui_timer.timeout.connect(self.board.update)
+        self.ui_timer = QTimer(self)            # webcam preview refresh (only its corner)
+        self.ui_timer.timeout.connect(self._refresh_cam)
+        self.cam_watch = QTimer(self)
+        self.cam_watch.timeout.connect(self._update_cam_label)
         self.finished.connect(self._on_saved)
-        self._cam_retries = 0
+        self.encoder_probed.connect(self._on_probed)
+
+        # encoder: probe Quick Sync once in the background, then remember the result
+        self.ffmpeg = find_ffmpeg()
+        self.encoder = str(self.store.value("encoder", "") or "")
+        if self.encoder not in ("libx264", "h264_qsv"):
+            self.encoder = "libx264"
+            threading.Thread(
+                target=lambda: self.encoder_probed.emit(probe_encoder(self.ffmpeg)),
+                daemon=True).start()
 
         self._build_toolbars()
-        self._apply_settings(self.cfg, clear_board=False)
-        self._start_webcam()
+        self._apply_settings(self.cfg, undoable=False)
+        self._set_cam(True)
         self.statusBar().showMessage("Ready. Press Settings to change board or camera options.")
 
         if self.cfg.get("startup", True):
             QTimer.singleShot(200, self._open_settings)
 
+    # ---------------------------------------------------------- settings
     def _load_settings(self):
         s = self.store
         return {
@@ -452,40 +792,37 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self):
         s = self.store
-        s.setValue("bg", self.cfg["bg"])
-        s.setValue("pen", self.cfg["pen"])
-        s.setValue("corner", self.cfg["corner"])
-        s.setValue("size", self.cfg["size"])
-        s.setValue("width", self.cfg["width"])
-        s.setValue("startup", self.cfg["startup"])
+        for k in ("bg", "pen", "corner", "size", "width", "startup"):
+            s.setValue(k, self.cfg[k])
         s.sync()
 
-    def _apply_settings(self, cfg, clear_board=True):
-        self.board.set_background(cfg["bg"], clear=clear_board)
+    def _apply_settings(self, cfg, undoable=True):
+        if QColor(cfg["bg"]) != self.board.bg:     # never wipe the board needlessly
+            self.board.set_background(cfg["bg"], undoable=undoable)
         self.board.pen_color = QColor(cfg["pen"])
         self.board.base_width = float(cfg["width"])
-        if cfg["corner"] in CAM_CORNERS:
-            self.board.cam_corner = cfg["corner"]
-        if cfg["size"] in CAM_SIZES:
-            self.board.cam_diam = cfg["size"]
-        if hasattr(self, "corner_btn"):
-            self.corner_btn.setText(f"Corner: {self.board.cam_corner}")
-        if hasattr(self, "camsize_btn"):
-            self.camsize_btn.setText("Cam size: " + "SML"[CAM_SIZES.index(self.board.cam_diam)])
-        if hasattr(self, "width_slider"):
-            self.width_slider.blockSignals(True)
-            self.width_slider.setValue(int(self.board.base_width))
-            self.width_slider.blockSignals(False)
-        self.board.update()
+        self.board.set_cam(cfg["corner"] if cfg["corner"] in CAM_CORNERS else None,
+                           cfg["size"] if cfg["size"] in CAM_SIZES else None)
+        self.corner_btn.setText(f"Corner: {self.board.cam_corner}")
+        self.camsize_btn.setText("Cam size: " + "SML"[CAM_SIZES.index(self.board.cam_diam)])
+        self.width_slider.blockSignals(True)
+        self.width_slider.setValue(int(self.board.base_width))
+        self.width_slider.blockSignals(False)
 
     def _open_settings(self):
         dlg = SettingsDialog(self, self.cfg)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.cfg = dlg.values()
             self._save_settings()
-            self._apply_settings(self.cfg, clear_board=False)
+            self._apply_settings(self.cfg)
             self.statusBar().showMessage("Settings saved.")
 
+    def _on_probed(self, enc):
+        self.encoder = enc
+        self.store.setValue("encoder", enc)
+        self.store.sync()
+
+    # ----------------------------------------------------------- toolbars
     def _build_toolbars(self):
         tb = QToolBar()
         tb.setMovable(False)
@@ -512,6 +849,12 @@ class MainWindow(QMainWindow):
         self.laser_btn.toggled.connect(self.board.set_laser)
         tb.addWidget(self.laser_btn)
         tb.addSeparator()
+
+        self.cam_btn = QPushButton("Camera")
+        self.cam_btn.setCheckable(True)
+        self.cam_btn.setChecked(True)
+        self.cam_btn.toggled.connect(self._set_cam)
+        tb.addWidget(self.cam_btn)
 
         self.cam_status = QLabel("  Camera: starting…  ")
         self.cam_status.setStyleSheet("font-weight:bold;padding:4px 10px;")
@@ -598,147 +941,88 @@ class MainWindow(QMainWindow):
         if path:
             self.board.image.save(path)
 
-    def _start_webcam(self):
-        if self.board.cam.start():
+    # ------------------------------------------------------------- webcam
+    def _set_cam(self, on):
+        """Turn the webcam on/off (off = zero camera CPU use)."""
+        if on:
             self.board.cam_on = True
-            self.ui_timer.start(33)
+            self.board.cam.start()                # connects/reconnects in its own thread
+            self.ui_timer.start(50)
+            self.cam_watch.start(500)
+            self._update_cam_label()
+        else:
+            self.board.cam.stop()
+            self.board.cam_on = False
+            self.ui_timer.stop()
+            self.cam_watch.stop()
+            self.cam_status.setText("  Camera: Off  ")
+            self.cam_status.setStyleSheet("font-weight:bold;padding:4px 10px;")
+            self.board.touch(self.board._cam_rect())
+
+    def _refresh_cam(self):
+        cam = self.board.cam
+        if cam.seq != self._seen_cam_seq:         # repaint just the camera circle
+            self._seen_cam_seq = cam.seq
+            self.board.update(self.board._to_widget_rect(self.board._cam_rect()))
+
+    def _update_cam_label(self):
+        if self.board.cam.state == "on":
             self.cam_status.setText("  Camera: On  ")
             self.cam_status.setStyleSheet("font-weight:bold;color:#2e7d32;padding:4px 10px;")
-            self._cam_retries = 0
         else:
             self.cam_status.setText("  Camera: waiting…  ")
             self.cam_status.setStyleSheet("font-weight:bold;color:#c62828;padding:4px 10px;")
-            if self._cam_retries < CAM_MAX_RETRIES:
-                self._cam_retries += 1
-                QTimer.singleShot(CAM_RETRY_MS, self._start_webcam)
-            else:
-                self.cam_status.setText("  Camera: not found  ")
-                self.statusBar().showMessage(
-                    "Webcam not detected. Close other apps using it, check the USB cable, then restart."
-                )
 
     def _cycle_corner(self):
         i = (CAM_CORNERS.index(self.board.cam_corner) + 1) % len(CAM_CORNERS)
-        self.board.cam_corner = CAM_CORNERS[i]
+        self.board.set_cam(corner=CAM_CORNERS[i])
         self.corner_btn.setText(f"Corner: {CAM_CORNERS[i]}")
         self.cfg["corner"] = CAM_CORNERS[i]
         self._save_settings()
-        self.board.update()
 
     def _cycle_cam_size(self):
         i = (CAM_SIZES.index(self.board.cam_diam) + 1) % len(CAM_SIZES)
-        self.board.cam_diam = CAM_SIZES[i]
+        self.board.set_cam(diam=CAM_SIZES[i])
         self.camsize_btn.setText("Cam size: " + "SML"[i])
         self.cfg["size"] = CAM_SIZES[i]
         self._save_settings()
-        self.board.update()
+
+    # ---------------------------------------------------------- recording
+    @property
+    def recording(self):
+        return self.rec is not None
 
     def toggle_recording(self):
         self.stop_recording() if self.recording else self.start_recording()
 
     def start_recording(self):
-        os.makedirs(OUT_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.base = os.path.join(OUT_DIR, f"lecture_{stamp}")
-        self.raw_video = self.base + "_raw.mp4"
-
-        self.writer = cv2.VideoWriter(
-            self.raw_video,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            FPS,
-            (CANVAS_W, CANVAS_H)
-        )
-
-        if not self.writer.isOpened():
-            self.statusBar().showMessage("Could not start the video writer.")
+        base = os.path.join(OUT_DIR, f"lecture_{stamp}")
+        rec = Recorder(base, self.ffmpeg, self.encoder,
+                       lambda msg, hw: self.finished.emit(msg, hw))
+        try:
+            rec.start()
+        except Exception as ex:
+            self.statusBar().showMessage(f"Could not start recording: {ex}")
             return
-
-        self.audio_chunks = []
-        self.stream = None
-        self.audio_rate = AUDIO_RATE
-        self.audio_error = ""
-        self.frames_written = 0
+        self.rec = rec
+        if rec.stream is None:
+            self.statusBar().showMessage(
+                f"Audio unavailable: {rec.audio_error} Recording video only.")
+        else:
+            self.statusBar().showMessage(
+                f"Recording ({'Quick Sync' if rec.encoder == 'h264_qsv' else 'software'} "
+                f"encoder, mic {rec.rate} Hz).")
         self.paused = False
         self.paused_total = 0.0
+        self._frame_sig = None
+        self._frame_bytes = None
         self.t0 = time.perf_counter()
-        self.recording = True
-
-        if sd is None:
-            self.audio_error = "sounddevice is not installed."
-        else:
-            try:
-                device_id = sd.default.device[0]
-
-                if device_id is None or device_id < 0:
-                    raise RuntimeError("No default microphone is selected.")
-
-                device = sd.query_devices(device_id, "input")
-
-                if int(device["max_input_channels"]) < 1:
-                    raise RuntimeError("Selected device has no microphone input.")
-
-                preferred_rate = int(
-                    device.get("default_samplerate") or AUDIO_RATE
-                )
-
-                rates = list(dict.fromkeys([
-                    preferred_rate, AUDIO_RATE, 48000
-                ]))
-
-                last_error = None
-
-                for rate in rates:
-                    try:
-                        sd.check_input_settings(
-                            device=device_id,
-                            channels=1,
-                            dtype="float32",
-                            samplerate=rate
-                        )
-
-                        stream = sd.InputStream(
-                            device=device_id,
-                            samplerate=rate,
-                            channels=1,
-                            dtype="float32",
-                            callback=self._audio_cb
-                        )
-
-                        stream.start()
-                        self.stream = stream
-                        self.audio_rate = rate
-                        break
-
-                    except Exception as ex:
-                        last_error = ex
-
-                if self.stream is None:
-                    raise RuntimeError(
-                        str(last_error or "Could not open microphone.")
-                    )
-
-            except Exception as ex:
-                self.stream = None
-                self.audio_error = str(ex)
-
-        if self.stream is None:
-            self.statusBar().showMessage(
-                f"Audio unavailable: {self.audio_error} Recording video only."
-            )
-        else:
-            self.statusBar().showMessage(
-                f"Recording video and microphone audio ({self.audio_rate} Hz)."
-            )
-
-        self.rec_timer.start(int(1000 / FPS / 2))
+        self.rec_timer.start(int(1000 / FPS))
         self.clock.start(500)
         self.rec_btn.setText("Stop Recording")
         self.rec_btn.setStyleSheet(STOP_STYLE)
         self.pause_btn.setEnabled(True)
-
-    def _audio_cb(self, indata, frames, time_info, status):
-        if self.recording and not self.paused:
-            self.audio_chunks.append(indata.copy())
 
     def _active_elapsed(self):
         now = time.perf_counter()
@@ -748,154 +1032,71 @@ class MainWindow(QMainWindow):
     def toggle_pause(self):
         if not self.recording:
             return
-
         if not self.paused:
             self.paused = True
+            self.rec.paused = True
             self.pause_started = time.perf_counter()
             self.pause_btn.setText("Resume")
-            self.statusBar().showMessage(
-                "Recording paused - nothing is being captured."
-            )
+            self.statusBar().showMessage("Recording paused - nothing is being captured.")
         else:
             self.paused_total += time.perf_counter() - self.pause_started
             self.paused = False
+            self.rec.paused = False
             self.pause_btn.setText("Pause")
             self.statusBar().showMessage("Recording resumed.")
 
     def _grab_frame(self):
-        if self.paused or not self.recording:
+        rec = self.rec
+        if rec is None or self.paused:
             return
-
-        due = int(self._active_elapsed() * FPS) - self.frames_written
-
+        due = int(self._active_elapsed() * FPS) - rec.frames
         if due <= 0:
             return
-
-        img = self.board.render_frame().convertToFormat(
-            QImage.Format.Format_RGB888
-        )
-
-        raw = img.constBits().asstring(img.sizeInBytes())
-        arr = np.frombuffer(raw, np.uint8).reshape(
-            img.height(), img.bytesPerLine()
-        )
-
-        frame = cv2.cvtColor(
-            arr[:, :img.width() * 3].reshape(
-                img.height(), img.width(), 3
-            ),
-            cv2.COLOR_RGB2BGR
-        )
-
-        for _ in range(min(due, FPS)):
-            self.writer.write(frame)
-            self.frames_written += 1
+        sig = (self.board.version, self.board.cam.seq if self.board.cam_on else -1)
+        if sig != self._frame_sig or self._frame_bytes is None:
+            img = self.board.render_frame()       # Format_RGB32 == BGRA bytes, no conversion
+            self._frame_bytes = img.constBits().asstring(img.sizeInBytes())
+            self._frame_sig = sig
+        rec.push(self._frame_bytes, min(due, FPS * 2))
 
     def _tick_label(self):
         s = int(self._active_elapsed())
-
         if self.paused:
-            self.timer_label.setText(
-                f"  PAUSED {s // 60:02d}:{s % 60:02d}  "
-            )
+            self.timer_label.setText(f"  PAUSED {s // 60:02d}:{s % 60:02d}  ")
         else:
-            self.timer_label.setText(
-                f"  {s // 60:02d}:{s % 60:02d}  "
-            )
+            self.timer_label.setText(f"  {s // 60:02d}:{s % 60:02d}  ")
 
     def stop_recording(self):
-        if not self.recording:
-            return
-
-        self.recording = False
+        rec, self.rec = self.rec, None
         self.rec_timer.stop()
         self.clock.stop()
-
-        if self.writer is not None:
-            self.writer.release()
-            self.writer = None
-
-        wav = None
-
-        if self.stream is not None:
-            try:
-                self.stream.stop()
-            except Exception:
-                pass
-
-            try:
-                self.stream.close()
-            except Exception:
-                pass
-
-            self.stream = None
-
-            if self.audio_chunks:
-                try:
-                    data = np.concatenate(self.audio_chunks, axis=0)
-                    data = np.clip(data, -1.0, 1.0)
-                    data = (data * 32767).astype(np.int16)
-
-                    wav = self.base + ".wav"
-
-                    with wave.open(wav, "wb") as w:
-                        w.setnchannels(1)
-                        w.setsampwidth(2)
-                        w.setframerate(self.audio_rate)
-                        w.writeframes(data.tobytes())
-
-                except Exception as ex:
-                    wav = None
-                    self.statusBar().showMessage(
-                        f"Audio export failed: {ex}"
-                    )
-
-        self.audio_chunks = []
+        rec.stop()                                # encoding finishes in the background
+        self.workers.append(rec.vthread)
+        self._frame_bytes = None
         self.paused = False
         self.rec_btn.setText("Start Recording")
         self.rec_btn.setStyleSheet(REC_STYLE)
         self.pause_btn.setText("Pause")
         self.pause_btn.setEnabled(False)
         self.timer_label.setText("  00:00  ")
-        self.statusBar().showMessage("Saving video, please wait...")
+        self.statusBar().showMessage("Finishing video, please wait...")
 
-        threading.Thread(
-            target=self._finalize,
-            args=(wav,),
-            daemon=True
-        ).start()
-
-    def _finalize(self, wav):
-        final = self.base + ".mp4"
-        ffmpeg = find_ffmpeg()
-        try:
-            if ffmpeg:
-                cmd = [ffmpeg, "-y", "-i", self.raw_video]
-                if wav:
-                    cmd += ["-i", wav]
-                cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p",
-                        "-preset", "veryfast", "-crf", "20"]
-                if wav:
-                    cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
-                cmd += [final]
-                subprocess.run(cmd, check=True, capture_output=True)
-                os.remove(self.raw_video)
-                if wav:
-                    os.remove(wav)
-            else:
-                os.replace(self.raw_video, final)
-        except Exception as ex:
-            self.finished.emit(f"Saved raw files in {OUT_DIR} (conversion failed: {ex})")
-            return
-        self.finished.emit(f"Saved: {final}")
-
-    def _on_saved(self, msg):
+    def _on_saved(self, msg, hw_failed):
+        if hw_failed:
+            self._on_probed("libx264")
+            self.encoder = "libx264"
         self.statusBar().showMessage(msg)
 
     def closeEvent(self, e):
         if self.recording:
             self.stop_recording()
         self.board.cam.stop()
+        self.ui_timer.stop()
+        self.cam_watch.stop()
+        self.statusBar().showMessage("Finishing video, please wait...")
+        QApplication.processEvents()
+        for t in self.workers:                    # don't lose the last lecture
+            t.join(timeout=300)
         e.accept()
 
 
