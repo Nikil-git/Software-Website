@@ -3,15 +3,26 @@ Physics Software - whiteboard + lecture recorder (Python 3, PyQt6)
 
 Tuned for a low-power laptop (Dell Vostro 15-3568, Core i3-6006U, HD 520,
 4-8 GB RAM, HDD):
-  * 1280x720 @ 24 fps (a whiteboard does not need more, and it is 2.25x
-    cheaper than 1080p)
-  * frames are streamed straight into ffmpeg (no huge raw file, no second
-    encode pass); audio is streamed to disk in chunks (no growing RAM list)
-  * only 3 worker threads (webcam, video writer, audio writer); ffmpeg is
-    limited to 2 threads and runs at below-normal priority
-  * Intel Quick Sync (h264_qsv) is used automatically if your ffmpeg has it
-  * unchanged frames are not re-rendered; the screen repaints only the
-    small area that changed
+  * 1280x720 @ 24 fps, streamed straight into ffmpeg (no huge raw file)
+  * audio streamed to disk in chunks (no growing RAM list)
+  * undo snapshots stored PNG-compressed in RAM (a flat whiteboard image
+    compresses ~10-20x, so 10 undo steps cost a few MB instead of ~35 MB)
+  * only 3 worker threads (webcam, video writer, audio writer); ffmpeg
+    limited to 2 threads, below-normal priority; coarse Qt timers to cut
+    wake-ups; webcam at 640x480/15fps internally, shown at 200px
+  * unchanged frames are reused rather than re-rendered; the screen
+    repaints only the area that changed
+  * Intel Quick Sync (h264_qsv) used automatically if ffmpeg supports it
+
+License gate (see LICENSE section below):
+  * on startup, and every few hours while running, the app checks a small
+    JSON status file you host (e.g. a GitHub Gist raw URL)
+  * {"status": "active"}  -> works normally
+  * {"status": "locked", "message": "..."}  -> the board and the Start
+    Recording button are disabled and your message is shown; nothing he
+    already recorded is touched or deleted
+  * if there is no internet, the last known status is kept for a grace
+    period (default 3 days) before the app locks itself as a precaution
 
 pip install PyQt6 opencv-python numpy sounddevice imageio-ffmpeg
 (For Quick Sync, put a full ffmpeg build on PATH, e.g. from gyan.dev.)
@@ -24,11 +35,14 @@ import queue
 import shutil
 import threading
 import subprocess
+import urllib.request
+import json
 from datetime import datetime
 
 import numpy as np
 import cv2
-from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QEvent, pyqtSignal, QSettings
+from PyQt6.QtCore import (Qt, QTimer, QPointF, QRectF, QEvent, pyqtSignal,
+                          QSettings, QBuffer, QIODevice, QByteArray)
 from PyQt6.QtGui import (QImage, QPainter, QPen, QColor, QAction, QKeySequence,
                          QPointingDevice, QPainterPath, QRadialGradient, QBrush,
                          QFont, QFontMetrics)
@@ -43,16 +57,16 @@ except Exception:
     sd = None
 
 # ----------------------------------------------------------------- settings
-CANVAS_W, CANVAS_H = 1280, 720        # video size (set 1920, 1080 only on a faster PC)
-S = CANVAS_H / 1080.0                 # scale factor for sizes designed at 1080p
+CANVAS_W, CANVAS_H = 1280, 720        # video size (set 1920,1080 only on a faster PC)
+S = CANVAS_H / 1080.0
 FPS = 24
 AUDIO_RATE = 44100
 OUT_DIR = os.path.join(os.path.expanduser("~"), "Videos", "PhysicsBoard")
-MAX_UNDO = 10                         # each snapshot is ~3.5 MB at 720p
-VIDEO_QUEUE = 6                       # frames waiting for the encoder (~21 MB max)
-IO_BUFFER = 1 << 20                   # 1 MB sequential disk writes
-CAM_RES = 240                         # internal webcam square size
-CAM_FPS = 20                          # webcam processing rate (saves CPU)
+MAX_UNDO = 12                          # cheap now: snapshots are PNG-compressed
+VIDEO_QUEUE = 6
+IO_BUFFER = 1 << 20
+CAM_RES = 200                           # smaller = less CPU (tune down further if needed)
+CAM_FPS = 15
 CAM_RETRY_S = 2.0
 CAM_SIZES = [int(200 * S), int(280 * S), int(380 * S)]
 CAM_CORNERS = ["bottom-right", "bottom-left", "top-right", "top-left"]
@@ -75,6 +89,17 @@ DEFAULTS = {
 WIN = sys.platform == "win32"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if WIN else 0
 BELOW_NORMAL = 0x00004000 if WIN else 0
+
+# --------------------------------------------------------------- LICENSE ---
+# Host a tiny JSON file somewhere you control (a GitHub Gist's "raw" URL is
+# the easiest: create a gist with a file named status.json, then paste its
+# raw link below). Edit that file whenever you want to lock or unlock.
+#   Unlocked : {"status": "active"}
+#   Locked   : {"status": "locked", "message": "Please contact Nikil to renew."}
+LICENSE_URL = "https://gist.githubusercontent.com/YOUR_USERNAME/YOUR_GIST_ID/raw/status.json"
+LICENSE_CHECK_INTERVAL_S = 6 * 3600     # re-check every 6 hours while running
+LICENSE_GRACE_S = 3 * 24 * 3600         # work offline up to 3 days on the last known state
+LICENSE_TIMEOUT_S = 8
 
 
 def find_ffmpeg():
@@ -101,6 +126,71 @@ def probe_encoder(ffmpeg):
         return "h264_qsv" if r.returncode == 0 else "libx264"
     except Exception:
         return "libx264"
+
+
+# ------------------------------------------------------------------- license
+class LicenseGate:
+    """Background-checks LICENSE_URL and reports ("active"/"locked"/"unknown", message).
+    Never touches recorded files; it only tells MainWindow whether to allow use.
+    Fails safe-ish: no internet keeps the last known state for LICENSE_GRACE_S,
+    then locks with a "couldn't verify" message so the app can't be used forever
+    offline, but a short outage never interrupts a lecture."""
+
+    def __init__(self, settings, on_status, url=None):
+        self.settings = settings
+        self.on_status = on_status      # called from a worker thread with (status, message)
+        self.url = url if url is not None else LICENSE_URL   # read fresh, not frozen at import
+        self._stop = False
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self):
+        self._stop = True
+
+    def check_once(self):
+        """One check; updates the cache and calls on_status. Safe to call off the UI thread."""
+        status, message = self._fetch()
+        now = time.time()
+        if status in ("active", "locked"):
+            self.settings.setValue("lic/status", status)
+            self.settings.setValue("lic/message", message)
+            self.settings.setValue("lic/ts", now)
+            self.settings.sync()
+            self.on_status(status, message)
+            return
+        # fetch failed: fall back to the cached state within the grace period
+        cached = self.settings.value("lic/status", "")
+        ts = float(self.settings.value("lic/ts", 0) or 0)
+        if cached in ("active", "locked") and (now - ts) < LICENSE_GRACE_S:
+            self.on_status(cached, self.settings.value("lic/message", ""))
+        elif cached == "":
+            # very first run with no internet at all: don't brick a fresh install
+            self.on_status("active", "")
+        else:
+            self.on_status("locked", "Could not verify the licence (no internet for "
+                                     "too long). Please connect to the internet.")
+
+    def _fetch(self):
+        try:
+            req = urllib.request.Request(self.url, headers={"Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=LICENSE_TIMEOUT_S) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            status = str(data.get("status", "")).lower()
+            if status not in ("active", "locked"):
+                return "unknown", ""
+            return status, str(data.get("message", "Please contact the developer to renew."))
+        except Exception:
+            return "unknown", ""
+
+    def _loop(self):
+        self.check_once()
+        while not self._stop:
+            for _ in range(int(LICENSE_CHECK_INTERVAL_S * 10)):
+                if self._stop:
+                    return
+                time.sleep(0.1)
+            self.check_once()
 
 
 # ------------------------------------------------------------------- webcam
@@ -144,7 +234,7 @@ class Webcam:
         if not cap.isOpened():
             cap.release()
             return None
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)     # small capture = less USB/CPU work
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
@@ -152,7 +242,7 @@ class Webcam:
     def _run(self, gen):
         interval = 1.0 / CAM_FPS
         while self._alive(gen):
-            cap = self._open()                      # opened here, so the UI never freezes
+            cap = self._open()
             if cap is None:
                 if gen == self._gen:
                     self.state = "waiting"
@@ -161,15 +251,15 @@ class Webcam:
             self.state = "on"
             fails, last = 0, 0.0
             while self._alive(gen):
-                if not cap.grab():                  # cheap: no decoding yet
+                if not cap.grab():
                     fails += 1
-                    if fails >= 40:                 # camera lost
+                    if fails >= 40:
                         break
                     time.sleep(0.05)
                     continue
                 fails = 0
                 now = time.time()
-                if now - last < interval:           # skip frames we don't need
+                if now - last < interval:
                     continue
                 ok, img = cap.retrieve()
                 if not ok or img is None:
@@ -198,7 +288,7 @@ class Recorder:
         self.base = base
         self.ffmpeg = ffmpeg
         self.encoder = encoder
-        self.on_done = on_done                       # on_done(message, hw_failed)
+        self.on_done = on_done
         self.video_tmp = base + "_video.mp4"
         self.wav = base + ".wav"
         self.final = base + ".mp4"
@@ -219,7 +309,6 @@ class Recorder:
         self.error = ""
         self.audio_error = ""
 
-    # ---- start
     def start(self, use_mic=True):
         os.makedirs(OUT_DIR, exist_ok=True)
         if self.ffmpeg:
@@ -254,7 +343,7 @@ class Recorder:
             dev = sd.query_devices(kind="input")
             dev_id = sd.default.device[0]
             if dev_id is None or dev_id < 0:
-                dev_id = None                         # None = system default input
+                dev_id = None
             if int(dev.get("max_input_channels", 0)) < 1:
                 raise RuntimeError("No microphone input device is available.")
             rates = []
@@ -303,7 +392,7 @@ class Recorder:
 
     def _audio_cb(self, indata, frames, time_info, status):
         if not self.paused:
-            self.aq.put_nowait(indata.copy())          # tiny; the writer thread drains it
+            self.aq.put_nowait(indata.copy())
 
     def _audio_loop(self):
         try:
@@ -316,10 +405,7 @@ class Recorder:
             self.wf.close()
             self.wfile.close()
 
-    # ---- video
     def push(self, data, count):
-        """Queue `count` copies of the same frame (same bytes object, no extra RAM).
-        If the encoder is behind, stop; the caller catches up on the next tick."""
         for _ in range(count):
             try:
                 self.vq.put_nowait(data)
@@ -332,7 +418,7 @@ class Recorder:
             self.proc.stdin.write(data)
         else:
             arr = np.frombuffer(data, np.uint8).reshape(CANVAS_H, CANVAS_W, 4)
-            self.cvw.write(np.ascontiguousarray(arr[:, :, :3]))   # bgra -> bgr
+            self.cvw.write(np.ascontiguousarray(arr[:, :, :3]))
 
     def _video_loop(self):
         ok = True
@@ -343,7 +429,7 @@ class Recorder:
             if ok:
                 try:
                     self._write(data)
-                except Exception as ex:                # e.g. ffmpeg died: keep draining
+                except Exception as ex:
                     ok = False
                     self.error = str(ex)
         self._finish(ok)
@@ -393,11 +479,10 @@ class Recorder:
                 os.replace(self.video_tmp, self.final)
                 if has_audio:
                     note = " (ffmpeg not found: audio kept as a separate .wav file)"
-            for p in (self.log_path,):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+            try:
+                os.remove(self.log_path)
+            except OSError:
+                pass
             self.on_done(f"Saved: {self.final}{note}", False)
         except Exception as ex:
             self.on_done(f"Saved raw files in {OUT_DIR} (finishing failed: {ex})", False)
@@ -413,7 +498,7 @@ class Board(QWidget):
         self.pen_color = QColor("#ffffff")
         self.base_width = 4.0
         self.eraser_on = False
-        self.undo_stack = []            # list of (image, background colour)
+        self.undo_stack = []            # list of (QByteArray PNG, background colour)
         self.drawing = False
         self.last = None
         self.laser_on = False
@@ -423,9 +508,9 @@ class Board(QWidget):
         self.cam_on = False
         self.cam_diam = CAM_SIZES[1]
         self.cam_corner = CAM_CORNERS[0]
-        self.version = 0                # bumps on every visible change (recorder uses it)
+        self.version = 0
+        self.locked = False             # set by the license gate
 
-        # watermark geometry computed once
         self._wm_font = QFont()
         self._wm_font.setPixelSize(int(26 * S))
         self._wm_font.setBold(True)
@@ -438,7 +523,6 @@ class Board(QWidget):
         self.setMouseTracking(True)
         self.setMinimumSize(640, 360)
 
-    # ---- geometry helpers
     def _view(self):
         s = min(self.width() / CANVAS_W, self.height() / CANVAS_H)
         return s, (self.width() - CANVAS_W * s) / 2, (self.height() - CANVAS_H * s) / 2
@@ -465,7 +549,6 @@ class Board(QWidget):
         return QRectF(pt.x() - r, pt.y() - r, 2 * r, 2 * r)
 
     def touch(self, *rects):
-        """Mark the picture as changed and repaint only the affected area."""
         self.version += 1
         if not rects:
             self.update()
@@ -474,7 +557,6 @@ class Board(QWidget):
             if r is not None:
                 self.update(self._to_widget_rect(r))
 
-    # ---- painting
     def _draw_overlays(self, p):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         frame = self.cam.frame if self.cam_on else None
@@ -502,7 +584,6 @@ class Board(QWidget):
             p.drawEllipse(c, r, r)
             p.setBrush(QColor(255, 255, 255))
             p.drawEllipse(c, 3, 3)
-        # watermark
         if self.bg.lightness() < 128:
             fill, fg = QColor(0, 0, 0, 120), QColor(255, 255, 255, 210)
         else:
@@ -515,7 +596,6 @@ class Board(QWidget):
         p.drawText(self._wm_rect, Qt.AlignmentFlag.AlignCenter, WATERMARK)
 
     def render_frame(self):
-        """Board + overlays as one image (this is what gets recorded)."""
         img = self.image.copy()
         p = QPainter(img)
         self._draw_overlays(p)
@@ -524,7 +604,7 @@ class Board(QWidget):
 
     def paintEvent(self, ev):
         s, x0, y0 = self._view()
-        p = QPainter(self)                      # Qt already clips this to the dirty area
+        p = QPainter(self)
         p.fillRect(ev.rect(), QColor("#222"))
         if abs(s - 1.0) > 0.01:
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -533,16 +613,24 @@ class Board(QWidget):
         p.drawImage(0, 0, self.image)
         self._draw_overlays(p)
 
-    # ---- undo keeps the board colour together with the picture
+    # ---- undo: PNG-compressed in RAM (a flat whiteboard compresses hugely)
     def push_undo(self):
-        self.undo_stack.append((self.image.copy(), QColor(self.bg)))
+        buf = QByteArray()
+        qbuf = QBuffer(buf)
+        qbuf.open(QIODevice.OpenModeFlag.WriteOnly)
+        self.image.save(qbuf, "PNG")
+        qbuf.close()
+        self.undo_stack.append((buf, QColor(self.bg)))
         if len(self.undo_stack) > MAX_UNDO:
             self.undo_stack.pop(0)
 
     def undo(self):
-        if self.undo_stack:
-            self.image, self.bg = self.undo_stack.pop()
-            self.touch()
+        if not self.undo_stack:
+            return
+        buf, bg = self.undo_stack.pop()
+        self.image.loadFromData(buf, "PNG")
+        self.bg = bg
+        self.touch()
 
     def clear(self):
         self.push_undo()
@@ -550,7 +638,6 @@ class Board(QWidget):
         self.touch()
 
     def set_background(self, color, undoable=True):
-        """Changing board colour wipes the board (old ink would be unreadable)."""
         if undoable:
             self.push_undo()
         self.bg = QColor(color)
@@ -577,7 +664,6 @@ class Board(QWidget):
         self.laser_pos = pt
         self.touch(self._laser_rect(old), self._laser_rect(pt))
 
-    # ---- drawing
     def _segment(self, p0, p1, pressure, erase):
         painter = QPainter(self.image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -596,13 +682,15 @@ class Board(QWidget):
         self.touch(QRectF(p0, p1).normalized().adjusted(-m, -m, m, m))
 
     def _press(self, pos, pressure, erase):
+        if self.locked:
+            return
         self.push_undo()
         self.drawing = True
         self.last = self._to_canvas(pos)
         self._segment(self.last, self.last, pressure, erase)
 
     def _move(self, pos, pressure, erase):
-        if not self.drawing:
+        if self.locked or not self.drawing:
             return
         cur = self._to_canvas(pos)
         self._segment(self.last, cur, pressure, erase)
@@ -615,6 +703,9 @@ class Board(QWidget):
         t = e.type()
         if t == QEvent.Type.TabletLeaveProximity:
             self._move_laser(None)
+            e.accept()
+            return
+        if self.locked:
             e.accept()
             return
         if self.laser_on:
@@ -632,12 +723,16 @@ class Board(QWidget):
         e.accept()
 
     def mousePressEvent(self, e):
+        if self.locked:
+            return
         if self.laser_on:
             self._move_laser(self._to_canvas(e.position()))
         elif e.button() == Qt.MouseButton.LeftButton:
             self._press(e.position(), 0.6, self.eraser_on)
 
     def mouseMoveEvent(self, e):
+        if self.locked:
+            return
         if self.laser_on:
             self._move_laser(self._to_canvas(e.position()))
         else:
@@ -649,6 +744,37 @@ class Board(QWidget):
     def leaveEvent(self, e):
         if self.laser_pos is not None:
             self._move_laser(None)
+
+
+# ------------------------------------------------------------ lock overlay
+class LockOverlay(QWidget):
+    """Full-board translucent cover shown when the licence check says 'locked'.
+    Purely visual/input-blocking - it never deletes or touches saved videos."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setStyleSheet("background: rgba(10,10,10,235);")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(40, 40, 40, 40)
+        self.title = QLabel("Software locked")
+        self.title.setStyleSheet("color:#ff6b6b;font-size:26px;font-weight:bold;")
+        self.msg = QLabel("")
+        self.msg.setStyleSheet("color:white;font-size:16px;")
+        self.msg.setWordWrap(True)
+        for w in (self.title, self.msg):
+            w.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addStretch()
+        lay.addWidget(self.title)
+        lay.addWidget(self.msg)
+        lay.addStretch()
+        self.hide()
+
+    def show_message(self, text):
+        self.msg.setText(text or "Please contact the developer to continue using this software.")
+        self.setGeometry(self.parent().rect())
+        self.show()
+        self.raise_()
 
 
 # ----------------------------------------------------------- settings dialog
@@ -729,6 +855,7 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     finished = pyqtSignal(str, bool)
     encoder_probed = pyqtSignal(str)
+    license_status = pyqtSignal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -736,6 +863,7 @@ class MainWindow(QMainWindow):
         self.resize(1280, 780)
         self.board = Board()
         self.setCentralWidget(self.board)
+        self.lock_overlay = LockOverlay(self.board)
 
         self.store = QSettings("PhysicsSoftware", "PhysicsBoard")
         self.cfg = self._load_settings()
@@ -753,15 +881,17 @@ class MainWindow(QMainWindow):
         self.rec_timer = QTimer(self)
         self.rec_timer.timeout.connect(self._grab_frame)
         self.clock = QTimer(self)
+        self.clock.setTimerType(Qt.TimerType.CoarseTimer)   # fewer wake-ups, saves power
         self.clock.timeout.connect(self._tick_label)
-        self.ui_timer = QTimer(self)            # webcam preview refresh (only its corner)
+        self.ui_timer = QTimer(self)
         self.ui_timer.timeout.connect(self._refresh_cam)
         self.cam_watch = QTimer(self)
+        self.cam_watch.setTimerType(Qt.TimerType.CoarseTimer)
         self.cam_watch.timeout.connect(self._update_cam_label)
         self.finished.connect(self._on_saved)
         self.encoder_probed.connect(self._on_probed)
+        self.license_status.connect(self._on_license)
 
-        # encoder: probe Quick Sync once in the background, then remember the result
         self.ffmpeg = find_ffmpeg()
         self.encoder = str(self.store.value("encoder", "") or "")
         if self.encoder not in ("libx264", "h264_qsv"):
@@ -770,13 +900,37 @@ class MainWindow(QMainWindow):
                 target=lambda: self.encoder_probed.emit(probe_encoder(self.ffmpeg)),
                 daemon=True).start()
 
+        self.license = LicenseGate(
+            self.store, lambda st, msg: self.license_status.emit(st, msg))
+        self.license.start()
+
         self._build_toolbars()
         self._apply_settings(self.cfg, undoable=False)
         self._set_cam(True)
-        self.statusBar().showMessage("Ready. Press Settings to change board or camera options.")
+        self.statusBar().showMessage("Checking licence...")
 
         if self.cfg.get("startup", True):
             QTimer.singleShot(200, self._open_settings)
+
+    # ---------------------------------------------------------- licence
+    def _on_license(self, status, message):
+        locked = status == "locked"
+        self.board.locked = locked
+        if locked:
+            if self.recording:
+                self.stop_recording()           # stop cleanly; already-saved files are kept
+            self.lock_overlay.show_message(message)
+            self.statusBar().showMessage("This software is locked.")
+        else:
+            self.lock_overlay.hide()
+            self.statusBar().showMessage("Ready.")
+        self.rec_btn.setEnabled(not locked)
+        self.pause_btn.setEnabled(not locked and self.recording)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.lock_overlay.isVisible():
+            self.lock_overlay.setGeometry(self.board.rect())
 
     # ---------------------------------------------------------- settings
     def _load_settings(self):
@@ -797,7 +951,7 @@ class MainWindow(QMainWindow):
         s.sync()
 
     def _apply_settings(self, cfg, undoable=True):
-        if QColor(cfg["bg"]) != self.board.bg:     # never wipe the board needlessly
+        if QColor(cfg["bg"]) != self.board.bg:
             self.board.set_background(cfg["bg"], undoable=undoable)
         self.board.pen_color = QColor(cfg["pen"])
         self.board.base_width = float(cfg["width"])
@@ -810,6 +964,8 @@ class MainWindow(QMainWindow):
         self.width_slider.blockSignals(False)
 
     def _open_settings(self):
+        if self.board.locked:
+            return
         dlg = SettingsDialog(self, self.cfg)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.cfg = dlg.values()
@@ -943,12 +1099,11 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- webcam
     def _set_cam(self, on):
-        """Turn the webcam on/off (off = zero camera CPU use)."""
         if on:
             self.board.cam_on = True
-            self.board.cam.start()                # connects/reconnects in its own thread
-            self.ui_timer.start(50)
-            self.cam_watch.start(500)
+            self.board.cam.start()
+            self.ui_timer.start(66)             # ~15fps preview refresh, matches CAM_FPS
+            self.cam_watch.start(800)
             self._update_cam_label()
         else:
             self.board.cam.stop()
@@ -961,7 +1116,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_cam(self):
         cam = self.board.cam
-        if cam.seq != self._seen_cam_seq:         # repaint just the camera circle
+        if cam.seq != self._seen_cam_seq:
             self._seen_cam_seq = cam.seq
             self.board.update(self.board._to_widget_rect(self.board._cam_rect()))
 
@@ -993,9 +1148,13 @@ class MainWindow(QMainWindow):
         return self.rec is not None
 
     def toggle_recording(self):
+        if self.board.locked:
+            return
         self.stop_recording() if self.recording else self.start_recording()
 
     def start_recording(self):
+        if self.board.locked:
+            return
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = os.path.join(OUT_DIR, f"lecture_{stamp}")
         rec = Recorder(base, self.ffmpeg, self.encoder,
@@ -1054,7 +1213,7 @@ class MainWindow(QMainWindow):
             return
         sig = (self.board.version, self.board.cam.seq if self.board.cam_on else -1)
         if sig != self._frame_sig or self._frame_bytes is None:
-            img = self.board.render_frame()       # Format_RGB32 == BGRA bytes, no conversion
+            img = self.board.render_frame()
             self._frame_bytes = img.constBits().asstring(img.sizeInBytes())
             self._frame_sig = sig
         rec.push(self._frame_bytes, min(due, FPS * 2))
@@ -1070,7 +1229,7 @@ class MainWindow(QMainWindow):
         rec, self.rec = self.rec, None
         self.rec_timer.stop()
         self.clock.stop()
-        rec.stop()                                # encoding finishes in the background
+        rec.stop()
         self.workers.append(rec.vthread)
         self._frame_bytes = None
         self.paused = False
@@ -1088,6 +1247,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
 
     def closeEvent(self, e):
+        self.license.stop()
         if self.recording:
             self.stop_recording()
         self.board.cam.stop()
@@ -1095,7 +1255,7 @@ class MainWindow(QMainWindow):
         self.cam_watch.stop()
         self.statusBar().showMessage("Finishing video, please wait...")
         QApplication.processEvents()
-        for t in self.workers:                    # don't lose the last lecture
+        for t in self.workers:
             t.join(timeout=300)
         e.accept()
 
