@@ -96,7 +96,7 @@ BELOW_NORMAL = 0x00004000 if WIN else 0
 # raw link below). Edit that file whenever you want to lock or unlock.
 #   Unlocked : {"status": "active"}
 #   Locked   : {"status": "locked", "message": "Please contact Nikil to renew."}
-LICENSE_URL = "https://gist.githubusercontent.com/YOUR_USERNAME/YOUR_GIST_ID/raw/status.json"
+LICENSE_URL = "https://gist.githubusercontent.com/Nikil-git/33441a58e1aa2fe75f6b7f3acdd501ca/raw/status.json"
 LICENSE_CHECK_INTERVAL_S = 6 * 3600     # re-check every 6 hours while running
 LICENSE_GRACE_S = 3 * 24 * 3600         # work offline up to 3 days on the last known state
 LICENSE_TIMEOUT_S = 8
